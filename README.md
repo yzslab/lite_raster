@@ -24,6 +24,12 @@ python utils/eval_mipnerf360-second_moment_guided-opacity_growth_reg-log-rho_85-
 
 The renderer uses the project's gsplat for tile intersections and sorting. In basic mode, v1 handles its specialized LiDAR, minimum-axis and unbiased-depth requests, alternative camera models, and tile sizes other than 16. Ordinary SSIM loss uses RGB. The target density controller reads full-loss position moments and runs a separate auxiliary RGB backward for candidate AbsGrad. Controllers requiring a dedicated `render_ssim` gradient output should use the v1 renderer.
 
+Set `--model.renderer.cluster_size=128` to group Gaussian means in Morton order and cull clusters before dense pinhole projection. The default is `0`. The renderer refreshes bounds from current positions and scales on each view and rebuilds membership when densification replaces the model rows. Selected parameters form ordinary contiguous tensors ordered by original row, including equal-depth ties. With this option, per-Gaussian renderer outputs use compact row indices and `outputs["gaussian_ids"]` maps each row back to the model. GNS and SelectiveAdam consume this mapping. The existing v1 fallback renders the full scene.
+
+To train with the separate LiteGS Adam optimizer, append `-c configs/litegs_adam.yaml --model.renderer.cluster_size=128` after the lite_raster renderer config. Adam reads compact gradients and updates global FP32 parameters and moments using the model row IDs. It updates all rows in selected clusters, including zero-gradient rows with previous momentum. An unclustered render with tile intersections selects primitives intersecting a tile. The compact renderer gathers trainable raw parameters before activation and supplies row-sparse gradients to LiteGSAdam parameter groups. A dense regularizer can contribute to the same parameter. Model and optimizer checkpoints retain their usual row-major layout.
+
+Clustered rendering requires the FasterGS MortonEncoding CUDA extension. Install it in the training environment with `python -m pip install --no-build-isolation ~/src/nerficg/src/CudaUtils/MortonEncoding`, adjusting the path to your nerficg checkout.
+
 ## Operators
 
 The ordinary RGB warp backward defaults to two 16×8 regions per 16×16 tile. Each warp handles one region, skips splats whose alpha stays below the rendering threshold throughout it, and reduces gradients, AbsGrad and position moments before atomic accumulation.
@@ -33,3 +39,16 @@ For auxiliary AbsGrad sampling, the warp backward takes the candidate mask from 
 * `project(pre, means, scales, quats, ...)` takes the v1 camera tuple (world-to-camera matrix, intrinsics, image size, camera center) and returns the v1 projection tuple, an optional RaDe plane, and an optional RaDe normal.
 * `rasterize(..., flags=Mode.ALPHA, backward_impl="warp")` returns a fixed `RasterResult` with HWC images and optional per-Gaussian hit flags. Colors and normals have separate inputs. Unrequested outputs are `None`. `backward_impl="pixel"` selects the reference backward.
 * `sh_color(degree, dirs, dc, rest=None, visible=None)` evaluates SH degrees 0–4, adds 0.5 and clamps the result to nonnegative RGB.
+
+### Optimized clustered training in Improved-GS
+
+Append `-c configs/lite_raster-clustered.yaml` to an Improved-GS training configuration with a GNS budget. This selects 128-row Morton clusters, fused visible-row geometry and SH, LiteGSAdam and fused GNS statistics. The original projection, tile ordering and alpha-blending kernels consume the resulting compact rows. GNS can also use `fused_density_stats: true` with `cluster_size: 0`.
+
+The fused training path supports the vanilla FP32 Gaussian model with all six raw parameters managed by LiteGSAdam. The renderer reorders parameters, optimizer moments and registered per-Gaussian state together. Its bounds cache recognizes single visible-row optimizer updates and refreshes all clusters for other tracked parameter changes. Custom operations that write directly through CUDA pointers must increment PyTorch's tensor version after writing. The existing renderer path remains available for other model or optimizer combinations.
+
+To reproduce the 10k bicycle setup, append `configs/lite_raster-clustered-bicycle.yaml` after the clustered preset. This additional file sets the measured LiteGS budget curve, GPU image caching, downsampling and training length.
+
+```sh
+python main.py fit -c configs/improved-gs.yaml -c configs/lite_raster-clustered.yaml \
+  -c configs/lite_raster-clustered-bicycle.yaml --data.path="$HOME/data/Mip-NeRF360/bicycle" -n bicycle-clustered
+```

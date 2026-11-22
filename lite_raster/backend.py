@@ -85,6 +85,10 @@ def library(source, cc, channels=0, flags=0):
         digest.update((glm / "glm/detail/setup.hpp").read_bytes())
     elif source in ("raster", "warp_backward"):
         headers = ("raster_args.cuh",)
+    elif source == "cluster_preprocess":
+        headers = ("sh_color.cu",)
+    elif source == "cluster_bounds":
+        headers = ("cluster_cull.cu",)
     else:
         headers = ()
     for header in headers:
@@ -107,6 +111,18 @@ def library(source, cc, channels=0, flags=0):
         lib.launch.argtypes = [ct.POINTER(Args), P, ct.c_bool]
     elif source == "fused_projection":
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
+    elif source == "cluster_adam":
+        lib.cluster_adam.argtypes = [P] * 5 + [ct.c_int64, ct.c_int64, ct.c_int, ct.c_bool] + [ct.c_float] * 4 + [P]
+    elif source in ("cluster_cull", "cluster_bounds"):
+        lib.cluster_cull.argtypes = [P] * 5 + [ct.c_int] * 4 + [ct.c_float, P, P]
+        if source == "cluster_bounds":
+            lib.refresh_bounds.argtypes = [P, P, ct.c_int, P, ct.c_int, P, P, P]
+            lib.select_blocks.argtypes = [P, ct.c_int, ct.c_int, P, P, P]
+            lib.expand_rows.argtypes = [P, ct.c_int, P, P]
+    elif source == "cluster_preprocess":
+        lib.geometry.argtypes = [ct.POINTER(P), ct.c_int, ct.c_bool, P]
+        lib.colors.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, P]
+        lib.stats.argtypes = [ct.POINTER(P), ct.c_int, P]
     else:
         lib.sh_color.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_bool, P, ct.c_bool]
     return lib
