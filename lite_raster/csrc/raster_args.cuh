@@ -24,3 +24,10 @@ __device__ inline void write_normal(void *data, int pixel, int area, float3 norm
     p[area] = normal.y;
     p[2 * area] = normal.z;
 }
+
+// Match the original FP32 forward's rounding when two plane terms nearly
+// cancel. Reversing which product is fused can change inverse-depth gradients.
+__device__ __forceinline__ float pixel_depth(float3 plane, float dx, float dy, float ray_z) {
+    float slope = __fmaf_rn(plane.x, dx, __fmul_rn(plane.y, dy));
+    return __fmul_rn(__fadd_rn(slope, plane.z), ray_z);
+}

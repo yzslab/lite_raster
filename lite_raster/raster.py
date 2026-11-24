@@ -22,6 +22,10 @@ class Mode(IntFlag):
 
 
 _ALL_FLAGS = sum(Mode)
+_BACKWARD_SOURCES = {"pixel": "raster", "warp": "warp_backward", "chunk": "chunk_backward"}
+_MAP_FLAGS = (Mode.ALPHA, Mode.INVERSE, Mode.HARD, Mode.HARD_ALPHA, Mode.EXPECTED,
+              Mode.MEDIAN, Mode.NORMAL, Mode.HARD_DEPTH)  # RasterResult fields between render and hit
+_DEPTH_FLAGS = Mode.INVERSE | Mode.HARD | Mode.HARD_DEPTH | Mode.EXPECTED | Mode.MEDIAN
 
 
 class RasterResult(NamedTuple):
@@ -54,8 +58,9 @@ def _run(inputs, outputs, cache, spec, upstream=(), grads=(), absolute=None, mom
         inputs[-1].numel(),
     )
     with torch.cuda.device(xy.device):
-        source = "warp_backward" if grads and backward_impl == "warp" else "raster"
-        lib = library(source, gpu_cc(xy.device), colors.shape[-1], int(flags))
+        source = _BACKWARD_SOURCES[backward_impl] if grads else "raster"
+        channels = 0 if source == "chunk_backward" and upstream[0] is None else colors.shape[-1]
+        lib = library(source, gpu_cc(xy.device), channels, int(flags))
         check_launch(
             lib.launch(ct.byref(args), torch.cuda.current_stream().cuda_stream, bool(grads))
         )
@@ -105,6 +110,7 @@ class _Raster(torch.autograd.Function):
     def backward(ctx, *out_grads):
         saved = ctx.saved_tensors
         inputs, outputs, cache = saved[:11], saved[11:20], saved[20:]
+        width, height, flags, impl = ctx.spec
         xy = inputs[0]
         candidates = getattr(xy, "auxiliary_absgrad_candidates", None)
         collect_moments = getattr(xy, "compute_position_moments", False)
@@ -112,18 +118,30 @@ class _Raster(torch.autograd.Function):
             if candidates.dtype != torch.bool or candidates.device != xy.device or candidates.shape != (len(xy),):
                 raise ValueError("Expected a boolean auxiliary candidate mask on the projection device")
             candidates = candidates.contiguous()
-        abs_only = (candidates is not None and not collect_moments and ctx.spec[-1] == "warp"
+        abs_only = (candidates is not None and not collect_moments and impl != "pixel"
                     and inputs[3].shape[1] == 3)
+        if abs_only:
+            impl = "warp"
         grads = [None] * 8
         if not abs_only:
             for i, tensor in enumerate(inputs[:8]):
                 if tensor is not None and (i != 7 or ctx.needs_input_grad[7]):
                     grads[i] = torch.zeros_like(tensor)
-        spec = ctx.spec
-        if abs_only and out_grads[0] is not None and all(g is None for g in out_grads[1:]):
-            # SSIM supplies only dL/dRGB, even if this forward also returned maps.
-            width, height, _, impl = spec
-            spec = (width, height, Mode(0), impl)
+        if impl == "chunk":
+            upstream = [g.contiguous() if g is not None else None for g in out_grads[:-1]]
+            # Backward needs only maps with an adjoint. Forward caches also contain
+            # the ordinary last contributor/transmittance when hard maps were rendered.
+            active = Mode(0)
+            for flag, grad in zip(_MAP_FLAGS, upstream[1:]):
+                if grad is not None:
+                    active |= flag
+            if active & _DEPTH_FLAGS:
+                active |= flags & Mode.RADE
+            if active & Mode.NORMAL:
+                active |= flags & Mode.RAW_NORMAL
+            flags = active
+        elif abs_only and out_grads[0] is not None and all(g is None for g in out_grads[1:]):
+            flags = Mode(0)
             upstream = [out_grads[0].contiguous()]
         else:
             upstream = []
@@ -135,7 +153,8 @@ class _Raster(torch.autograd.Function):
                 upstream.append(g)
         absolute = torch.zeros_like(xy) if getattr(xy, "lite_absgrad", False) or candidates is not None else None
         moments = xy.new_zeros((len(xy), 6)) if collect_moments else None
-        _run(inputs, outputs, cache, spec, upstream, grads, absolute, moments, candidates if abs_only else None)
+        _run(inputs, outputs, cache, (width, height, flags, impl), upstream, grads, absolute, moments,
+             candidates if abs_only else None)
         if absolute is not None:
             previous = getattr(xy, "absgrad", None)
             xy.absgrad = absolute if previous is None else previous + absolute
@@ -157,12 +176,14 @@ def rasterize(
     A positive color channel count requests render. Mode selects each other output
     independently, including ALPHA, HARD_ALPHA and the per-Gaussian HIT mask.
     Image tensors are contiguous CHW. Unrequested fields in the returned tuple are None.
-    backward_impl selects one thread per pixel ("pixel") or warp-reduced
-    gradients ("warp"). Both use the same FP32 forward and saved tensors.
+    backward_impl selects the pixel reference, warp reduction (default), or
+    "chunk" for chunk-scheduled gradients of all image outputs with optional
+    AbsGrad and position moments. Candidate-only AbsGrad uses its dedicated
+    warp kernel. All three share the forward pass.
     """
     w, h = size
-    if backward_impl not in ("pixel", "warp"):
-        raise ValueError("backward_impl must be 'pixel' or 'warp'")
+    if backward_impl not in _BACKWARD_SOURCES:
+        raise ValueError("backward_impl must be 'pixel', 'warp' or 'chunk'")
     n = len(xy)
     if not xy.is_cuda or xy.dtype != torch.float32 or xy.shape != (n, 2) or not xy.is_contiguous():
         raise ValueError("xy must be a contiguous CUDA float32 [N,2] tensor")
@@ -193,9 +214,7 @@ def rasterize(
         raise ValueError("At most 513 feature channels are supported")
     if background is None:
         background = xy.new_zeros(channels)
-    active_depth = flags & (
-        Mode.INVERSE | Mode.HARD | Mode.HARD_DEPTH | Mode.EXPECTED | Mode.MEDIAN
-    )
+    active_depth = flags & _DEPTH_FLAGS
     result = _Raster.apply(
         xy,
         feature(conics, (n, 3)),

@@ -34,6 +34,8 @@ Clustered rendering requires the FasterGS MortonEncoding CUDA extension. Install
 
 The ordinary RGB warp backward defaults to two 16×8 regions per 16×16 tile. Each warp handles one region, skips splats whose alpha stays below the rendering threshold throughout it, and reduces gradients, AbsGrad and position moments before atomic accumulation.
 
+Append `-c configs/snippets/lite_raster_chunk_backward.yaml` to select `backward_impl="chunk"`. This PennyGS-style FP32 backward partitions each 16×16 tile into eight 8×4 pixel chunks and lets NVCC allocate registers. RGB or feature channels, alpha, inverse/expected/median depth, hard depth/inverse depth/alpha, and raw or normalized normals can contribute gradients in the same backward. Both center-Z and RaDe depth support this mode, including depth-only rendering. The kernel specializes on the images used in the loss, so returning auxiliary images for logging still allows the RGB-only fast path. Trainable backgrounds, AbsGrad and position moments are supported. Candidate-only AbsGrad sampling uses its dedicated warp kernel.
+
 For auxiliary AbsGrad sampling, the warp backward takes the candidate mask from the screen-space points. Each tile replays the occlusion needed by its candidates and accumulates absolute screen-position derivatives only for those candidates. A loss applied only to RGB selects the RGB backward specialization even when the forward returned additional maps.
 
 * `project(pre, means, scales, quats, ...)` takes the v1 camera tuple (world-to-camera matrix, intrinsics, image size, camera center) and returns the v1 projection tuple, an optional RaDe plane, and an optional RaDe normal.

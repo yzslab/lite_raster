@@ -20,13 +20,6 @@ __device__ __forceinline__ void tile_add(float *dst, float value) {
         atomicAdd(dst, value);
 }
 
-// Match the original FP32 forward's rounding when two plane terms nearly
-// cancel. Reversing which product is fused can change inverse-depth gradients.
-__device__ __forceinline__ float pixel_depth(float3 plane, float dx, float dy, float ray_z) {
-    float slope = __fmaf_rn(plane.x, dx, __fmul_rn(plane.y, dy));
-    return __fmul_rn(__fadd_rn(slope, plane.z), ray_z);
-}
-
 template <int D> struct PixelState {
     int last, hard_last, median_id, index;
     float trans, hard_trans, suffix, hard_suffix, ray_z;

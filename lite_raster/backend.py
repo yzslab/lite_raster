@@ -14,6 +14,7 @@ from filelock import FileLock
 
 HERE = Path(__file__).resolve().parent / "csrc"
 P = ct.c_void_p
+_RASTER_LIBRARIES = ("raster", "warp_backward", "chunk_backward")
 
 
 class Args(ct.Structure):
@@ -83,7 +84,9 @@ def library(source, cc, channels=0, flags=0):
         glm = _glm_include()
         options += ["--use_fast_math", "--expt-relaxed-constexpr", "-I" + str(glm)]
         digest.update((glm / "glm/detail/setup.hpp").read_bytes())
-    elif source in ("raster", "warp_backward"):
+    elif source == "chunk_backward":
+        headers = ("raster_args.cuh", "chunk_maps.cuh")
+    elif source in _RASTER_LIBRARIES:
         headers = ("raster_args.cuh",)
     elif source == "joint_loss":
         options += ["--use_fast_math"]
@@ -110,7 +113,7 @@ def library(source, cc, channels=0, flags=0):
             finally:
                 tmp.unlink(missing_ok=True)
     lib = ct.CDLL(str(target))
-    if source in ("raster", "warp_backward"):
+    if source in _RASTER_LIBRARIES:
         lib.launch.argtypes = [ct.POINTER(Args), P, ct.c_bool]
     elif source == "fused_projection":
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
