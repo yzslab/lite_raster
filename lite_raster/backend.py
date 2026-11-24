@@ -119,6 +119,9 @@ def library(source, cc, channels=0, flags=0):
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
     elif source == "joint_loss":
         lib.joint_loss.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_float, ct.c_bool, P]
+    elif source == "tile_loss":
+        lib.tile_loss.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_int, ct.c_int,
+                                  ct.c_float, ct.c_bool, P]
     elif source == "cluster_adam":
         lib.cluster_adam.argtypes = [P] * 5 + [ct.c_int64, ct.c_int64, ct.c_int, ct.c_bool] + [ct.c_float] * 4 + [P]
     elif source in ("cluster_cull", "cluster_bounds"):
