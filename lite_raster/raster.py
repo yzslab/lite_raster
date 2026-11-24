@@ -70,7 +70,7 @@ class _Raster(torch.autograd.Function):
 
         def image(channels, enabled=True, dtype=None):
             if enabled:
-                return torch.empty((h, w, channels), dtype=dtype or xy.dtype, device=xy.device)
+                return torch.empty((channels, h, w), dtype=dtype or xy.dtype, device=xy.device)
             return None
 
         hard = f & (Mode.HARD | Mode.HARD_DEPTH | Mode.HARD_ALPHA)
@@ -114,9 +114,11 @@ class _Raster(torch.autograd.Function):
             candidates = candidates.contiguous()
         abs_only = (candidates is not None and not collect_moments and ctx.spec[-1] == "warp"
                     and inputs[3].shape[1] == 3)
-        grads = [None] * 8 if abs_only else [torch.zeros_like(t) for t in inputs[:8]]
-        if not ctx.needs_input_grad[7]:
-            grads[7] = None
+        grads = [None] * 8
+        if not abs_only:
+            for i, tensor in enumerate(inputs[:8]):
+                if tensor is not None and (i != 7 or ctx.needs_input_grad[7]):
+                    grads[i] = torch.zeros_like(tensor)
         spec = ctx.spec
         if abs_only and out_grads[0] is not None and all(g is None for g in out_grads[1:]):
             # SSIM supplies only dL/dRGB, even if this forward also returned maps.
@@ -154,7 +156,7 @@ def rasterize(
 
     A positive color channel count requests render. Mode selects each other output
     independently, including ALPHA, HARD_ALPHA and the per-Gaussian HIT mask.
-    Image tensors are HWC. Unrequested fields in the returned tuple are None.
+    Image tensors are contiguous CHW. Unrequested fields in the returned tuple are None.
     backward_impl selects one thread per pixel ("pixel") or warp-reduced
     gradients ("warp"). Both use the same FP32 forward and saved tensors.
     """
@@ -179,7 +181,7 @@ def rasterize(
 
     def feature(t, shape, required=True):
         if t is None and not required:
-            return xy.new_empty(0)
+            return None
         if t is None or t.shape != shape or t.device != xy.device or t.dtype != xy.dtype:
             raise ValueError(f"Expected float32 tensor of shape {shape} on {xy.device}")
         return t.contiguous()

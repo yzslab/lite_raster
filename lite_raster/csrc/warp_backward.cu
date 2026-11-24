@@ -44,8 +44,15 @@ struct Splat {
     float opacity;
 };
 
-template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args a) {
+enum class RGBStats { Dynamic, None, Absolute };
+
+template <int D, int F, bool AbsOnly = false, RGBStats Stats = RGBStats::Dynamic> __global__ void warp_backward(Args a) {
     static_assert(!AbsOnly || D == 3);
+    constexpr bool dynamic = Stats == RGBStats::Dynamic;
+    const bool absolute_enabled = dynamic ? a.absgrad != nullptr : Stats == RGBStats::Absolute;
+    const bool moments_enabled = dynamic && a.moments;
+    const bool background_grad = dynamic && a.din[Background];
+    const int area = a.width * a.height;
     constexpr bool split_rgb = RGBOnly<D, F> && !AbsOnly;
     constexpr int parts = split_rgb ? RGBWarpsPerTile : 1;
     constexpr int group_w = split_rgb ? RGBWarpWidth : 16;
@@ -110,10 +117,10 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
         }
         if constexpr (normal) {
             if constexpr (F & RawNormal) {
-                p.normal_grad = ((const float3 *)a.dout[Nrm])[k];
+                p.normal_grad = read_normal(a.dout[Nrm], k, area);
             } else {
-                const float3 unit = ((const float3 *)a.out[Nrm])[k];
-                const float3 grad = ((const float3 *)a.dout[Nrm])[k];
+                const float3 unit = read_normal(a.out[Nrm], k, area);
+                const float3 grad = read_normal(a.dout[Nrm], k, area);
                 const float len = ((const float *)a.cache[NormLength])[k];
                 const float proj = len > 1e-12f ? grad.x * unit.x + grad.y * unit.y + grad.z * unit.z : 0.f;
                 const float den = fmaxf(1e-12f, len);
@@ -123,11 +130,11 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
         }
         p.suffix = -p.trans * da;
         for (int c = 0; c < D; ++c) {
-            const float dc = rgb_grad[k * D + c];
+            const float dc = rgb_grad[c * area + k];
             if constexpr (D <= 8)
                 p.colors[c] = dc;
             p.suffix += p.trans * dc * ((const float *)a.in[Background])[c];
-            if (!AbsOnly && a.din[Background])
+            if (!AbsOnly && background_grad)
                 bg_grad[c] += p.trans * dc;
         }
         if constexpr (depth && rade) {
@@ -137,7 +144,7 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
         }
         last_in_tile = max(last_in_tile, max(p.last, p.hard_last));
     }
-    if (!AbsOnly && a.din[Background])
+    if (!AbsOnly && background_grad)
         for (int c = 0; c < D; ++c)
             tile_add((float *)a.din[Background] + c, bg_grad[c]);
 
@@ -263,7 +270,7 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
                         if constexpr (D <= 8)
                             dc = p.colors[c];
                         else
-                            dc = rgb_grad[p.index * D + c];
+                            dc = rgb_grad[c * area + p.index];
                         if constexpr (stage_rgb)
                             dot += dc * batch_rgb[32 * warp + j][c];
                         else
@@ -306,11 +313,11 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
                     }
                     // The baseline records ordinary-branch statistics per pixel,
                     // before adding the hard branch or summing across the lane.
-                    if (AbsOnly || a.absgrad) {
+                    if (AbsOnly || absolute_enabled) {
                         absolute.x += fabsf(gx);
                         absolute.y += fabsf(gy);
                     }
-                    if (!AbsOnly && a.moments) {
+                    if (!AbsOnly && moments_enabled) {
                         moments[0] += gx;
                         moments[1] += gy;
                         moments[2] += gx * gx;
@@ -382,11 +389,11 @@ template <int D, int F, bool AbsOnly = false> __global__ void warp_backward(Args
                 tile_add(dc, conic_sum.x);
                 tile_add(dc + 1, conic_sum.y);
                 tile_add(dc + 2, conic_sum.z);
-                if (a.absgrad) {
+                if (absolute_enabled) {
                     tile_add((float *)a.absgrad + 2 * g, absolute.x);
                     tile_add((float *)a.absgrad + 2 * g + 1, absolute.y);
                 }
-                if (a.moments)
+                if (moments_enabled)
                     for (int c = 0; c < 6; ++c)
                         tile_add((float *)a.moments + 6 * g + c, moments[c]);
             }
@@ -408,6 +415,16 @@ extern "C" int launch(Args *args, cudaStream_t stream, bool backward) {
     }
     constexpr int parts = RGBOnly<CHANNELS, FLAGS> ? RGBWarpsPerTile : 1;
     const int grid_blocks = (tiles * parts + WarpsPerBlock - 1) / WarpsPerBlock;
+    if constexpr (CHANNELS == 3 && (FLAGS == 0 || FLAGS == ReturnHit)) {
+        if (!args->moments && !args->din[Background]) {
+            const dim3 threads(32, WarpsPerBlock);
+            if (args->absgrad)
+                warp_backward<3, 0, false, RGBStats::Absolute><<<grid_blocks, threads, 0, stream>>>(*args);
+            else
+                warp_backward<3, 0, false, RGBStats::None><<<grid_blocks, threads, 0, stream>>>(*args);
+            return cudaGetLastError();
+        }
+    }
     warp_backward<CHANNELS, FLAGS><<<grid_blocks, dim3(32, WarpsPerBlock), 0, stream>>>(*args);
     return cudaGetLastError();
 }

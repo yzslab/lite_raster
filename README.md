@@ -37,7 +37,7 @@ The ordinary RGB warp backward defaults to two 16×8 regions per 16×16 tile. Ea
 For auxiliary AbsGrad sampling, the warp backward takes the candidate mask from the screen-space points. Each tile replays the occlusion needed by its candidates and accumulates absolute screen-position derivatives only for those candidates. A loss applied only to RGB selects the RGB backward specialization even when the forward returned additional maps.
 
 * `project(pre, means, scales, quats, ...)` takes the v1 camera tuple (world-to-camera matrix, intrinsics, image size, camera center) and returns the v1 projection tuple, an optional RaDe plane, and an optional RaDe normal.
-* `rasterize(..., flags=Mode.ALPHA, backward_impl="warp")` returns a fixed `RasterResult` with HWC images and optional per-Gaussian hit flags. Colors and normals have separate inputs. Unrequested outputs are `None`. `backward_impl="pixel"` selects the reference backward.
+* `rasterize(..., flags=Mode.ALPHA, backward_impl="warp")` returns a fixed `RasterResult` with contiguous CHW images and optional per-Gaussian hit flags. Colors and normals have separate inputs. Unrequested outputs are `None`. `backward_impl="pixel"` selects the reference backward.
 * `sh_color(degree, dirs, dc, rest=None, visible=None)` evaluates SH degrees 0–4, adds 0.5 and clamps the result to nonnegative RGB.
 
 ### Optimized clustered training in Improved-GS
@@ -52,3 +52,9 @@ To reproduce the 10k bicycle setup, append `configs/lite_raster-clustered-bicycl
 python main.py fit -c configs/improved-gs.yaml -c configs/lite_raster-clustered.yaml \
   -c configs/lite_raster-clustered-bicycle.yaml --data.path="$HOME/data/Mip-NeRF360/bicycle" -n bicycle-clustered
 ```
+
+Since 0.2, all raster image fields use contiguous `[C, H, W]` storage, including RGB, normals and single-channel depth or alpha. Per-Gaussian arrays retain their original layout. Callers that need HWC can use `result.render.permute(1, 2, 0)`.
+
+Append `configs/lite_raster-fused-rgb.yaml` to the clustered bicycle preset for joint L1 + SSIM training. The preset caches targets as contiguous CHW. For ordinary RGB training with GNS or vanilla density control and compatible plugins, it skips the alpha image. Adam and LiteGSAdam also omit the per-Gaussian hit buffer. SelectiveAdam retains it for its optimizer update. Explicit auxiliary requests and evaluation use the full renderer. The warp backward selects an FP32 specialization when training requires only signed gradients or signed gradients plus AbsGrad.
+
+`lite_raster.loss.fused_l1_ssim(image, target, weight)` returns three differentiable scalars: weighted loss, L1 and SSIM. Pass `return_pixel_errors=True` to also receive the per-channel absolute residual. Each input is one FP32 CUDA image with a fixed target.

@@ -12,3 +12,15 @@ struct Args {
     const bool *absgrad_candidates;
     int width, height, count;
 };
+
+__device__ inline float3 read_normal(const void *data, int pixel, int area) {
+    const float *p = static_cast<const float *>(data) + pixel;
+    return {p[0], p[area], p[2 * area]};
+}
+
+__device__ inline void write_normal(void *data, int pixel, int area, float3 normal) {
+    float *p = static_cast<float *>(data) + pixel;
+    p[0] = normal.x;
+    p[area] = normal.y;
+    p[2 * area] = normal.z;
+}

@@ -21,6 +21,7 @@ template <int D, int F, bool Back> __global__ void raster(Args a) {
     constexpr bool depth = inv || hardInverse || hardZ || expz || median;
     const int x = blockIdx.x * 16 + threadIdx.x, y = blockIdx.y * 16 + threadIdx.y;
     const int pixel = y * a.width + x, tile = blockIdx.y * gridDim.x + blockIdx.x;
+    const int area = a.width * a.height;
     const bool inside = x < a.width && y < a.height;
     const int *offset = (int *)a.in[Offsets], *ids = (int *)a.in[Ids];
     const int begin = offset[tile], end = tile + 1 == gridDim.x * gridDim.y ? a.count : offset[tile + 1];
@@ -72,9 +73,9 @@ template <int D, int F, bool Back> __global__ void raster(Args a) {
             }
             if constexpr (normal) {
                 if constexpr (F & RawNormal) {
-                    dn = ((float3 *)a.dout[Nrm])[pixel];
+                    dn = read_normal(a.dout[Nrm], pixel, area);
                 } else {
-                    float3 unit = ((float3 *)a.out[Nrm])[pixel], g = ((float3 *)a.dout[Nrm])[pixel];
+                    float3 unit = read_normal(a.out[Nrm], pixel, area), g = read_normal(a.dout[Nrm], pixel, area);
                     float len = CACHE(NormLength, float)[pixel], proj = len > 1e-12f ? dot3(g, unit) : 0;
                     float den = fmaxf(len, 1e-12f);
                     dn = {(g.x - unit.x * proj) / den, (g.y - unit.y * proj) / den,
@@ -83,7 +84,7 @@ template <int D, int F, bool Back> __global__ void raster(Args a) {
             }
             suffix = -T * da;
             for (int c = 0; c < D; c++) {
-                dc[c] = GRAD(RGB)[pixel * D + c];
+                dc[c] = GRAD(RGB)[c * area + pixel];
                 suffix += T * dc[c] * bg[c];
                 if (a.din[Background])
                     atomicAdd((float *)a.din[Background] + c, T * dc[c]);
@@ -284,7 +285,7 @@ template <int D, int F, bool Back> __global__ void raster(Args a) {
     if constexpr (!Back)
         if (inside) {
             for (int c = 0; c < D; c++)
-                OUT(RGB)[pixel * D + c] = rgb[c] + T * bg[c];
+                OUT(RGB)[c * area + pixel] = rgb[c] + T * bg[c];
             CACHE(Last, int)[pixel] = last;
             CACHE(Trans, float)[pixel] = T;
             if constexpr (F & ReturnAlpha)
@@ -309,11 +310,11 @@ template <int D, int F, bool Back> __global__ void raster(Args a) {
             }
             if constexpr (normal) {
                 if constexpr (F & RawNormal) {
-                    ((float3 *)a.out[Nrm])[pixel] = n;
+                    write_normal(a.out[Nrm], pixel, area, n);
                 } else {
                     float len = sqrtf(dot3(n, n)), den = fmaxf(1e-12f, len);
                     CACHE(NormLength, float)[pixel] = len;
-                    ((float3 *)a.out[Nrm])[pixel] = {n.x / den, n.y / den, n.z / den};
+                    write_normal(a.out[Nrm], pixel, area, {n.x / den, n.y / den, n.z / den});
                 }
             }
         }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lite-raster"
-version = "0.1.0"
+version = "0.2.1"
 description = "Single-view CUDA Gaussian projection and rasterization for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ dependencies = ["torch", "filelock"]
 
 [tool.setuptools]
 packages = ["lite_raster"]
-license-files = ["LICENSE-gsplat"]
+license-files = ["LICENSE-gsplat", "LICENSE-fused-ssim"]
 
 [tool.setuptools.package-data]
 lite_raster = ["csrc/*.cu", "csrc/*.cuh"]
