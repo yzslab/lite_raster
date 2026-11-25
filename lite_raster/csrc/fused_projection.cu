@@ -6,15 +6,9 @@
 #include "pinhole.cuh"
 #include "rade_geometry.cuh"
 
-namespace {
-using namespace gsplat;
-using V = vec3<float>;
-using Q = vec4<float>;
-using M = mat3<float>;
-using M2 = mat2<float>;
-enum Output { Radius, XY, Z, Conic, Direction, LegacyNormal, Distance, Compensation, Plane, Normal };
-enum Mode { Planes = 1, Normals = 2, Legacy = 4 };
-struct Args {
+namespace lite_raster {
+// NVCC 12.8 requires this argument type to have external linkage to export projection().
+struct ProjectionArgs {
     const float *mean, *scale, *quat, *view, *K, *center;
     void *out[10];
     const float *up[10];
@@ -23,6 +17,16 @@ struct Args {
     int n, w, h;
     float eps, clip;
 };
+} // namespace lite_raster
+
+namespace {
+using namespace gsplat;
+using V = vec3<float>;
+using Q = vec4<float>;
+using M = mat3<float>;
+using M2 = mat2<float>;
+enum Output { Radius, XY, Z, Conic, Direction, LegacyNormal, Distance, Compensation, Plane, Normal };
+enum Mode { Planes = 1, Normals = 2, Legacy = 4 };
 
 __device__ V grad3(const float *v, int i) { return v ? glm::make_vec3(v + 3*i) : V(0.f); }
 __device__ float grad1(const float *v, int i) { return v ? v[i] : 0.f; }
@@ -91,7 +95,7 @@ __device__ M mm(M a, M b) {
 }
 
 template<int Mode, bool Back>
-__global__ void project(Args a) {
+__global__ void project(lite_raster::ProjectionArgs a) {
     constexpr bool plane = Mode & Planes, normal = Mode & Normals, legacy = Mode & Legacy;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= a.n) return;
@@ -246,14 +250,14 @@ __global__ void project(Args a) {
 }
 
 template<int Mode>
-void launch(const Args &a, cudaStream_t stream, bool back) {
+void launch(const lite_raster::ProjectionArgs &a, cudaStream_t stream, bool back) {
     const int blocks = (a.n - 1) / 128 + 1;
     if (back) project<Mode, true><<<blocks,128,0,stream>>>(a);
     else project<Mode, false><<<blocks,128,0,stream>>>(a);
 }
 } // namespace
 
-extern "C" int projection(const Args *a, int mode, cudaStream_t stream, bool back) {
+extern "C" int projection(const lite_raster::ProjectionArgs *a, int mode, cudaStream_t stream, bool back) {
     if (!a->n) return cudaSuccess;
     switch (mode) {
         case 0: launch<0>(*a, stream, back); break;
