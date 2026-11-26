@@ -1,5 +1,6 @@
 // 11-tap Gaussian and SSIM derivatives adapted from LiteGS/fused-ssim (LICENSE-fused-ssim).
 #include <cuda_runtime.h>
+#include "rgb_error.cuh"
 
 namespace {
 constexpr int Tile = 16, Radius = 5, Shared = Tile + 2 * Radius;
@@ -64,7 +65,8 @@ __device__ float2 block_sum(float2 value, int tid) {
 }
 
 __global__ void image_statistics(const float *image, const float *target, int h, int w,
-                                  float *d_mean, float *d_square, float *d_product, float2 *sums, float *errors) {
+                                  float *d_mean, float *d_square, float *d_product, float2 *sums, float *errors,
+                                  float lambda_l2) {
     __shared__ float tile[Shared][Shared][2];
     __shared__ float rows[Shared][Tile][5];
     const float *const images[] = {image, target};
@@ -102,7 +104,7 @@ __global__ void image_statistics(const float *image, const float *target, int h,
         // Match the installed fused-ssim convention, including its backward at saturation.
         const float raw = (C * D) / (A * B);
         const bool saturated = raw < -1.f || raw > 1.f;
-        stats = {fabsf(image[index] - target[index]), fmaxf(-1.f, fminf(1.f, raw))};
+        stats = {pixel_error<rgb_loss>(image[index], target[index], lambda_l2), fmaxf(-1.f, fminf(1.f, raw))};
         if (errors) errors[index] = stats.x;
         d_mean[index] = saturated ? 0.f : (2.f*b*D) / (A*B) - (2.f*b*C) / (A*B)
                       - (2.f*a*C*D) / (A*A*B) + (2.f*a*C*D) / (A*B*B);
@@ -115,7 +117,7 @@ __global__ void image_statistics(const float *image, const float *target, int h,
 }
 
 __global__ void finish_mean(const float2 *sums, int count, int pixels, float weight,
-                             float *loss, float *l1, float *ssim) {
+                             float *loss, float *rgb_diff, float *ssim) {
     float2 total = {};
     for (int i = threadIdx.x; i < count; i += blockDim.x) {
         total.x += sums[i].x;
@@ -123,22 +125,22 @@ __global__ void finish_mean(const float2 *sums, int count, int pixels, float wei
     }
     total = block_sum(total, threadIdx.x);
     if (threadIdx.x == 0) {
-        *l1 = total.x / pixels;
+        *rgb_diff = total.x / pixels;
         *ssim = total.y / pixels;
-        *loss = (1.f - weight) * *l1 + weight * (1.f - *ssim);
+        *loss = (1.f - weight) * *rgb_diff + weight * (1.f - *ssim);
     }
 }
 
 __global__ void image_gradient(const float *image, const float *target, int h, int w,
                                const float *d_mean, const float *d_square, const float *d_product,
-                               const float *g_loss, const float *g_l1, const float *g_ssim,
-                               float weight, float *gradient, const float *g_errors) {
+                               const float *g_loss, const float *g_rgb, const float *g_ssim,
+                               float weight, float lambda_l2, float *gradient, const float *g_errors) {
     __shared__ float tile[Shared][Shared][3];
     __shared__ float rows[Shared][Tile][3];
     const float *const derivatives[] = {d_mean, d_square, d_product};
     const float chain = g_loss ? *g_loss : 0.f;
     const int count = gridDim.z * h * w;
-    const float wl = ((1.f - weight) * chain + (g_l1 ? *g_l1 : 0.f)) / count;
+    const float wl = ((1.f - weight) * chain + (g_rgb ? *g_rgb : 0.f)) / count;
     const float ws = (-weight * chain + (g_ssim ? *g_ssim : 0.f)) / count;
     load_tile(tile, derivatives, h, w, ws);
     for (int y = threadIdx.y; y < Shared; y += Tile) {
@@ -161,20 +163,22 @@ __global__ void image_gradient(const float *image, const float *target, int h, i
         vertical(rows, deriv);
         const int i = (blockIdx.z * h + y) * w + x;
         const float a = image[i], b = target[i];
-        const float sign = float(a > b) - float(a < b);
-        gradient[i] = (deriv[0] + 2.f*a*deriv[1] + b*deriv[2]) + wl * sign
-                    + (g_errors ? g_errors[i] * sign : 0.f);
+        const float rgb_grad = pixel_error_grad<rgb_loss>(a, b, lambda_l2);
+        gradient[i] = (deriv[0] + 2.f*a*deriv[1] + b*deriv[2]) + wl * rgb_grad
+                    + (g_errors ? g_errors[i] * rgb_grad : 0.f);
     }
 }
 }
 
-extern "C" int joint_loss(float **p, int h, int w, int channels, float weight, bool backward, cudaStream_t stream) {
+extern "C" int joint_loss(float **p, int h, int w, int channels, float weight, float lambda_l2,
+                          bool backward, cudaStream_t stream) {
     const dim3 block(Tile, Tile), grid((w + Tile - 1) / Tile, (h + Tile - 1) / Tile, channels);
     if (backward) {
-        image_gradient<<<grid, block, 0, stream>>>(p[0], p[1], h, w, p[2], p[3], p[4], p[5], p[6], p[7], weight, p[8], p[9]);
+        image_gradient<<<grid, block, 0, stream>>>(p[0], p[1], h, w, p[2], p[3], p[4], p[5], p[6], p[7],
+                                                    weight, lambda_l2, p[8], p[9]);
     } else {
         auto *tiles = reinterpret_cast<float2 *>(p[5]);
-        image_statistics<<<grid, block, 0, stream>>>(p[0], p[1], h, w, p[2], p[3], p[4], tiles, p[9]);
+        image_statistics<<<grid, block, 0, stream>>>(p[0], p[1], h, w, p[2], p[3], p[4], tiles, p[9], lambda_l2);
         if (auto err = cudaGetLastError()) return err;
         finish_mean<<<1, 256, 0, stream>>>(tiles, grid.x * grid.y * channels, h*w*channels, weight, p[6], p[7], p[8]);
     }
