@@ -4,6 +4,7 @@ from weakref import ref
 
 import torch
 
+from ._chained import project_encode
 from .backend import AdamGroup, P, ProjectionStep, check_launch, gpu_cc, library, pointer
 from .preprocess import _check_rows, _gather_geometry
 from .projection import _outputs, _position_stats, _run
@@ -100,30 +101,35 @@ class BackwardAdam:
 
 class _ProjectAdam(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, ids, means, log_scales, quats, logits, view, K, center, spec, compensate, adam):
+    def forward(ctx, ids, means, log_scales, quats, logits, view, K, center, spec, compensate, adam,
+                chained_isect, tile_size):
         ctx.set_materialize_grads(False)
         raw = means, log_scales, quats, logits
         (pos, scales, rot, alpha), length = _gather_geometry(ids, raw)
         inputs = pos, scales, rot, view, K, center
         outputs = _outputs(pos, spec[-1], compensate)
         opacity = pos.new_empty(len(ids))
-        step = ProjectionStep(ids=pointer(ids), alpha=pointer(alpha), opacity=pointer(opacity))
-        _run(inputs, outputs, (), (), (), spec, False, step)
+        if chained_isect is None:
+            step = ProjectionStep(ids=pointer(ids), alpha=pointer(alpha), opacity=pointer(opacity))
+            _run(inputs, outputs, (), (), (), spec, False, step)
+            intersections = ()
+        else:
+            intersections = project_encode(inputs, outputs, spec, chained_isect, tile_size, alpha, opacity)
         ctx.spec, ctx.adam = spec, adam
         radii, xy, _, conic, _, _, _, comp = outputs[:8]
         ctx.save_for_backward(ids, alpha, length, *inputs, radii, conic, comp, *raw)
         ctx.position_moment_state = {}
         xy.position_moment_state = ctx.position_moment_state
-        return *outputs, opacity, scales
+        return *outputs, opacity, scales, *intersections
 
     @staticmethod
     def backward(ctx, *grads):
-        ctx.adam._queue_geometry(ctx, grads[:10], *grads[10:])
-        return (None,) * 11
+        ctx.adam._queue_geometry(ctx, grads[:10], *grads[10:12])
+        return (None,) * len(ctx.needs_input_grad)
 
 
 def project_adam(pre, ids, means, scales, rotations, opacities, adam, *, eps, radius_clip,
-                 compensate=False, planes=False, normals=False, legacy=False):
+                 compensate=False, planes=False, normals=False, legacy=False, isect_tile_size=None, chained_isect=None):
     """Gather raw rows, project and return the opacity consumed by tile encoding and blending."""
     _check_rows(ids, means)
     view, K, (w, h), center = pre
@@ -135,6 +141,11 @@ def project_adam(pre, ids, means, scales, rotations, opacities, adam, *, eps, ra
     if legacy and (planes or normals):
         raise ValueError("Select basic normals or RaDe geometry")
     mode = int(planes) | (int(normals) << 1) | (int(legacy) << 2)
+    if chained_isect is None and isect_tile_size is not None:
+        chained_isect = "precise"
+    tile_size = 16 if isect_tile_size is None else isect_tile_size
     result = _ProjectAdam.apply(ids, *inputs[:4], *(t.detach().contiguous() for t in inputs[4:]),
-                                (w, h, eps, radius_clip, mode), compensate, adam)
+                                (w, h, eps, radius_clip, mode), compensate, adam, chained_isect, tile_size)
+    if chained_isect is not None:
+        return result[:8], *result[8:12], result[12:]
     return result[:8], *result[8:]

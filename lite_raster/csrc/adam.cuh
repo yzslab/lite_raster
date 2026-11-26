@@ -2,12 +2,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace lite_raster {
-struct AdamGroup {
-    float *param, *first, *second;
-    float lr, beta1, beta2, eps;
-};
+#include "projection_api.h"
 
+namespace lite_raster {
 __device__ inline void adam_update(AdamGroup a, int64_t dst, float g) {
     float m = a.beta1 * a.first[dst] + (1.f - a.beta1) * g;
     float v = a.beta2 * a.second[dst] + (1.f - a.beta2) * g * g;

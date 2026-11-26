@@ -21,12 +21,13 @@ _INCLUDES = {
     "raster": ("raster_args.cuh",),
     "warp_backward": ("raster_args.cuh",),
     "chunk_backward": ("raster_args.cuh", "chunk_maps.cuh"),
-    "fused_projection": ("pinhole.cuh", "rade_geometry.cuh", "adam.cuh"),
+    "fused_projection": ("pinhole.cuh", "rade_geometry.cuh", "adam.cuh", "projection_api.h"),
+    "intersections": ("tile_intersections.cuh", "projection_api.h"),
     "tile_loss": ("rgb_error.cuh",),
     "joint_loss": ("rgb_error.cuh",),
-    "cluster_preprocess": ("sh_color.cu", "adam.cuh"),
+    "cluster_preprocess": ("sh_color.cu", "adam.cuh", "projection_api.h"),
     "cluster_bounds": ("cluster_cull.cu",),
-    "cluster_cull": (), "cluster_adam": ("adam.cuh",), "sh_color": (),
+    "cluster_cull": (), "cluster_adam": ("adam.cuh", "projection_api.h"), "sh_color": (),
 }
 
 
@@ -144,7 +145,7 @@ def compiled_path(source, cc, channels=0, flags=0):
     digest = hashlib.sha256()
     digest.update(_version(nvcc))
     digest.update(_version(str(host)))
-    if source in ("fused_projection", "joint_loss"):
+    if source in ("fused_projection", "intersections", "joint_loss"):
         options.append("--use_fast_math")
     if source == "fused_projection":
         glm = _glm_include()

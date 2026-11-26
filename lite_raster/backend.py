@@ -36,6 +36,11 @@ class ProjectionStep(ct.Structure):
     ] + [("geometry_grad", ct.c_bool)]
 
 
+class TilePairs(ct.Structure):
+    _fields_ = [(name, P) for name in ("opacity", "counts", "keys", "ids")] + [
+        (name, ct.c_int) for name in ("tile_size", "width", "height")]
+
+
 class ProjectionArgs(ct.Structure):
     _fields_ = [
         ("inputs", P * 6), ("outputs", P * 10), ("upstream", P * 10),
@@ -53,6 +58,11 @@ def library(source, cc, channels=0, flags=0):
     elif source == "fused_projection":
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
         lib.projection_adam.argtypes = [*lib.projection.argtypes, ct.POINTER(ProjectionStep)]
+    elif source == "intersections":
+        lib.intersect_tiles.argtypes = [ct.POINTER(TilePairs), ct.c_int, P, P, P, P, P, P]
+        lib.sort_pairs.argtypes = [P, ct.POINTER(ct.c_size_t), P, P, P, P, ct.c_int, ct.c_int,
+                                   ct.POINTER(ct.c_int), P]
+        lib.encode_offsets.argtypes = [P, ct.c_int, P, ct.c_int, P]
     elif source == "joint_loss":
         lib.joint_loss.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_float, ct.c_float, ct.c_bool, P]
     elif source == "tile_loss":

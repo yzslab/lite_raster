@@ -3,6 +3,7 @@ import ctypes as ct
 
 import torch
 
+from ._chained import project_encode
 from .backend import P, ProjectionArgs, check_launch, gpu_cc, library, pointer
 
 
@@ -59,17 +60,21 @@ def _position_stats(means, state):
 
 class _Projection(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, means, scales, quats, view, K, center, spec, compensate):
+    def forward(ctx, means, scales, quats, view, K, center, spec, compensate, isect):
         ctx.set_materialize_grads(False)
         ctx.spec = spec
         inputs = means, scales, quats, view, K, center
         outputs = _outputs(means, spec[-1], compensate)
         radii, xy, _, conic, _, _, _, comp = outputs[:8]
-        _run(inputs, outputs, (), (), (), spec, False)
+        if isect is None:
+            _run(inputs, outputs, (), (), (), spec, False)
+            intersections = ()
+        else:
+            intersections = project_encode(inputs, outputs, spec, *isect)
         ctx.save_for_backward(*inputs, radii, conic, comp)
         ctx.position_moment_state = {}
         xy.position_moment_state = ctx.position_moment_state
-        return outputs
+        return (*outputs, *intersections)
 
     @staticmethod
     def backward(ctx, *upstream):
@@ -80,12 +85,17 @@ class _Projection(torch.autograd.Function):
         grads.append(torch.zeros_like(view) if ctx.needs_input_grad[3] else None)
         outputs = (radii, None, None, conic, None, None, None, comp, None, None)
         stats = _position_stats(means, ctx.position_moment_state)
-        _run(inputs, outputs, [t.contiguous() if t is not None else None for t in upstream],
+        _run(inputs, outputs, [t.contiguous() if t is not None else None for t in upstream[:10]],
              grads, stats, ctx.spec, True)
-        return (*grads, None, None, None, None)
+        return tuple(grads) + (None,) * (len(ctx.needs_input_grad) - len(grads))
 
 
-def project(pre, means, scales, quats, eps=0.3, radius_clip=0., compensate=False, planes=False, normals=False, legacy=False):
+def project(pre, means, scales, quats, eps=0.3, radius_clip=0., compensate=False, planes=False, normals=False,
+            legacy=False, *, isect_opacities=None, tile_size=16, chained_isect=None):
+    """Optionally return tile lists. chained_isect='bbox' or 'precise' runs separate kernels
+    in one C++ call. Precise encoding takes activated, pre-AA isect_opacities.
+    Passing only isect_opacities selects chained precise encoding.
+    """
     view, K, (w, h), center = pre
     inputs = (means, scales, quats, view, K, center)
     n = len(means)
@@ -98,5 +108,11 @@ def project(pre, means, scales, quats, eps=0.3, radius_clip=0., compensate=False
     if legacy and (planes or normals):
         raise ValueError("Select basic normals or RaDe geometry")
     mode = int(planes) | (int(normals) << 1) | (int(legacy) << 2)
-    result = _Projection.apply(*(t.contiguous() for t in inputs), (w, h, eps, radius_clip, mode), compensate)
+    if chained_isect is None and isect_opacities is not None:
+        chained_isect = "precise"
+    isect = (chained_isect, tile_size, isect_opacities) if chained_isect is not None else None
+    result = _Projection.apply(*(t.contiguous() for t in inputs), (w, h, eps, radius_clip, mode),
+                               compensate, isect)
+    if isect is not None:
+        return result[:8], result[8], result[9], result[10:]
     return result[:8], result[8], result[9]

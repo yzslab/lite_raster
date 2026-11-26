@@ -8,27 +8,6 @@
 #include "pinhole.cuh"
 #include "rade_geometry.cuh"
 
-namespace lite_raster {
-// NVCC 12.8 requires this argument type to have external linkage to export projection().
-struct ProjectionArgs {
-    const float *mean, *scale, *quat, *view, *K, *center;
-    void *out[10];
-    const float *up[10];
-    float *gm, *gs, *gq, *gv;
-    float *stats[4]; // pixel, world, pixel_ssim, world_ssim
-    int n, w, h;
-    float eps, clip;
-};
-struct ProjectionStep {
-    AdamGroup groups[4]; // mean, log scale, raw quaternion, opacity logit
-    const int64_t *ids;
-    const float *alpha, *length;
-    float *opacity;
-    const float *d_opacity, *d_scale;
-    bool geometry_grad;
-};
-} // namespace lite_raster
-
 namespace {
 using namespace gsplat;
 using V = vec3<float>;
