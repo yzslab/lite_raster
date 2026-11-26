@@ -2,7 +2,9 @@
 // quaternion adjoints and center-path moment transform for the basic outputs.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <type_traits>
 #include <cooperative_groups.h>
+#include "adam.cuh"
 #include "pinhole.cuh"
 #include "rade_geometry.cuh"
 
@@ -16,6 +18,14 @@ struct ProjectionArgs {
     float *stats[4]; // pixel, world, pixel_ssim, world_ssim
     int n, w, h;
     float eps, clip;
+};
+struct ProjectionStep {
+    AdamGroup groups[4]; // mean, log scale, raw quaternion, opacity logit
+    const int64_t *ids;
+    const float *alpha, *length;
+    float *opacity;
+    const float *d_opacity, *d_scale;
+    bool geometry_grad;
 };
 } // namespace lite_raster
 
@@ -94,21 +104,59 @@ __device__ M mm(M a, M b) {
     return result;
 }
 
-template<int Mode, bool Back>
-__global__ void project(lite_raster::ProjectionArgs a) {
+struct NoStep {};
+
+__device__ void update_geometry(const lite_raster::ProjectionArgs &a, const lite_raster::ProjectionStep &step,
+                                int i, V gm, V gs, Q gq) {
+    const int64_t row = step.ids[i];
+    if (step.geometry_grad) {
+        const Q q = glm::make_vec4(a.quat + 4*i);
+        float length = step.length[i], norm = fmaxf(length, 1.e-12f);
+        float dot = length >= 1.e-12f ? q[0]*gq[0] + q[1]*gq[1] + q[2]*gq[2] + q[3]*gq[3] : 0.f;
+        for (int j = 0; j < 3; ++j) adam_update(step.groups[0], row*3+j, gm[j]);
+        for (int j = 0; j < 4; ++j)
+            adam_update(step.groups[2], row*4+j, __fdiv_rn(gq[j] - q[j]*dot, norm));
+    }
+    if (step.geometry_grad || step.d_scale) {
+        gs += grad3(step.d_scale, i);
+        for (int j = 0; j < 3; ++j)
+            adam_update(step.groups[1], row*3+j, a.scale[3*i+j] * gs[j]);
+    }
+    if (step.d_opacity) {
+        float alpha = step.alpha[i];
+        float grad = step.d_opacity[i];
+        if (a.out[Compensation]) grad *= static_cast<const float *>(a.out[Compensation])[i];
+        adam_update(step.groups[3], row, grad * (1.f - alpha) * alpha);
+    }
+}
+
+template<int Mode, bool Back, class Step>
+__global__ void project(lite_raster::ProjectionArgs a, Step step) {
+    constexpr bool fused = !std::is_same_v<Step, NoStep>;
     constexpr bool plane = Mode & Planes, normal = Mode & Normals, legacy = Mode & Legacy;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= a.n) return;
     int *radii = static_cast<int *>(a.out[Radius]);
     if constexpr (Back) {
+        if constexpr (fused) {
+            if (!step.geometry_grad) {
+                update_geometry(a, step, i, V(0.f), V(0.f), Q(0.f));
+                return;
+            }
+        }
         if (!radii[i]) {
-            if (a.gm) put3(a.gm + 3*i, V(0.f));
-            if (a.gs) put3(a.gs + 3*i, V(0.f));
-            if (a.gq) *reinterpret_cast<float4 *>(a.gq + 4*i) = make_float4(0,0,0,0);
+            if constexpr (fused) {
+                update_geometry(a, step, i, V(0.f), V(0.f), Q(0.f));
+            } else {
+                if (a.gm) put3(a.gm + 3*i, V(0.f));
+                if (a.gs) put3(a.gs + 3*i, V(0.f));
+                if (a.gq) *reinterpret_cast<float4 *>(a.gq + 4*i) = make_float4(0,0,0,0);
+            }
             return;
         }
     } else {
         radii[i] = 0;
+        if constexpr (fused) step.opacity[i] = a.out[Compensation] ? 0.f : step.alpha[i];
         put3(out3(a.out[Direction], i), V(0.f));
         if (a.out[Compensation]) static_cast<float *>(a.out[Compensation])[i] = 0.f;
         if constexpr (legacy) {
@@ -144,6 +192,8 @@ __global__ void project(lite_raster::ProjectionArgs a) {
         if (radius <= a.clip || xy.x+radius <= 0 || xy.x-radius >= a.w ||
             xy.y+radius <= 0 || xy.y-radius >= a.h) return;
         radii[i] = int(radius);
+        if constexpr (fused)
+            if (a.out[Compensation]) step.opacity[i] = step.alpha[i] * compensation;
         float *pos = static_cast<float *>(a.out[XY]) + 2*i;
         pos[0] = xy.x; pos[1] = xy.y;
         static_cast<float *>(a.out[Z])[i] = m.z;
@@ -208,9 +258,11 @@ __global__ void project(lite_raster::ProjectionArgs a) {
         V conic = glm::make_vec3(out3(a.out[Conic], i)), gc = grad3(a.up[Conic], i);
         const M2 inv(conic.x,conic.y,conic.y,conic.z);
         M2 gc2 = inverse_adjoint(conic, gc);
-        if (a.up[Compensation])
-            add_blur_vjp(a.eps, inv, static_cast<float *>(a.out[Compensation])[i],
-                         a.up[Compensation][i], gc2);
+        float gcomp = grad1(a.up[Compensation], i);
+        if constexpr (fused)
+            if (step.d_opacity) gcomp += __fmul_rn(step.d_opacity[i], step.alpha[i]);
+        if (a.out[Compensation] && (a.up[Compensation] || gcomp != 0.f))
+            add_blur_vjp(a.eps, inv, static_cast<float *>(a.out[Compensation])[i], gcomp, gc2);
         for (int j = 0; j < 4; j += 2)
             if (a.stats[j])
                 project_position_moments(m, R, fx, fy,
@@ -232,9 +284,13 @@ __global__ void project(lite_raster::ProjectionArgs a) {
         } else {
             quat_scale_to_covar_vjp(quat, s, axes, gcov, gq, gs);
         }
-        if (a.gm) put3(a.gm + 3*i, gm);
-        if (a.gs) put3(a.gs + 3*i, gs);
-        if (a.gq) for (int j = 0; j < 4; ++j) a.gq[4*i+j] = gq[j];
+        if constexpr (fused) {
+            update_geometry(a, step, i, gm, gs, gq);
+        } else {
+            if (a.gm) put3(a.gm + 3*i, gm);
+            if (a.gs) put3(a.gs + 3*i, gs);
+            if (a.gq) for (int j = 0; j < 4; ++j) a.gq[4*i+j] = gq[j];
+        }
         if (a.gv) {
             auto group = cooperative_groups::coalesced_threads();
             for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) {
@@ -249,23 +305,33 @@ __global__ void project(lite_raster::ProjectionArgs a) {
     }
 }
 
-template<int Mode>
-void launch(const lite_raster::ProjectionArgs &a, cudaStream_t stream, bool back) {
+template<int Mode, class Step>
+void launch(const lite_raster::ProjectionArgs &a, cudaStream_t stream, bool back, Step step) {
     const int blocks = (a.n - 1) / 128 + 1;
-    if (back) project<Mode, true><<<blocks,128,0,stream>>>(a);
-    else project<Mode, false><<<blocks,128,0,stream>>>(a);
+    if (back) project<Mode, true><<<blocks,128,0,stream>>>(a, step);
+    else project<Mode, false><<<blocks,128,0,stream>>>(a, step);
 }
-} // namespace
-
-extern "C" int projection(const lite_raster::ProjectionArgs *a, int mode, cudaStream_t stream, bool back) {
+template<class Step>
+int dispatch(const lite_raster::ProjectionArgs *a, int mode, cudaStream_t stream, bool back, Step step) {
     if (!a->n) return cudaSuccess;
     switch (mode) {
-        case 0: launch<0>(*a, stream, back); break;
-        case Planes: launch<Planes>(*a, stream, back); break;
-        case Normals: launch<Normals>(*a, stream, back); break;
-        case Planes | Normals: launch<Planes | Normals>(*a, stream, back); break;
-        case Legacy: launch<Legacy>(*a, stream, back); break;
+        case 0: launch<0>(*a, stream, back, step); break;
+        case Planes: launch<Planes>(*a, stream, back, step); break;
+        case Normals: launch<Normals>(*a, stream, back, step); break;
+        case Planes | Normals: launch<Planes | Normals>(*a, stream, back, step); break;
+        case Legacy: launch<Legacy>(*a, stream, back, step); break;
         default: return cudaErrorInvalidValue;
     }
     return cudaGetLastError();
+}
+
+} // namespace
+
+extern "C" int projection(const lite_raster::ProjectionArgs *a, int mode, cudaStream_t stream, bool back) {
+    return dispatch(a, mode, stream, back, NoStep{});
+}
+
+extern "C" int projection_adam(const lite_raster::ProjectionArgs *a, int mode, cudaStream_t stream, bool back,
+                               const lite_raster::ProjectionStep *step) {
+    return dispatch(a, mode, stream, back, *step);
 }

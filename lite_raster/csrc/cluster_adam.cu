@@ -1,6 +1,6 @@
 // LiteGS's uncorrected Adam update for row-major Gaussian parameters.
 // rows maps compact gradient rows onto persistent model and moment rows.
-#include <cuda_runtime.h>
+#include "adam.cuh"
 #include <cstdint>
 
 namespace {
@@ -14,11 +14,7 @@ __global__ void update(float* param, const float* grad, float* first, float* sec
     if (row < 0 || row >= total_rows) return;
     const int64_t dst = row * width + i % width;
     const float g = grad[dense_grad ? dst : i];
-    const float m = beta1 * first[dst] + (1.f - beta1) * g;
-    const float v = beta2 * second[dst] + (1.f - beta2) * g * g;
-    param[dst] += -lr * m / (sqrtf(v) + eps);
-    first[dst] = m;
-    second[dst] = v;
+    lite_raster::adam_update({param, first, second, lr, beta1, beta2, eps}, dst, g);
 }
 }
 

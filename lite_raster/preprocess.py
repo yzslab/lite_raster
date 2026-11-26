@@ -23,15 +23,20 @@ def _check_rows(ids, reference):
         raise ValueError("Expected contiguous int64 row IDs on the input CUDA device")
 
 
+def _gather_geometry(ids, inputs):
+    outputs = [t.new_empty((len(ids), *t.shape[1:])) for t in inputs]
+    lengths = inputs[0].new_empty(len(ids))
+    buffers = (ids, *(t.contiguous() for t in inputs), *outputs, lengths)
+    _launch("geometry", inputs[0], buffers, len(ids), False)
+    return outputs, lengths
+
+
 class _Geometry(torch.autograd.Function):
     @staticmethod
     def forward(ctx, ids, means, log_scales, quats, logits):
         ctx.set_materialize_grads(False)
         inputs = means, log_scales, quats, logits
-        outputs = [t.new_empty((len(ids), *t.shape[1:])) for t in inputs]
-        lengths = means.new_empty(len(ids))
-        buffers = (ids, *(t.contiguous() for t in inputs), *outputs, lengths)
-        _launch("geometry", means, buffers, len(ids), False)
+        outputs, lengths = _gather_geometry(ids, inputs)
         ctx.save_for_backward(ids, *outputs[1:], lengths)
         ctx.shapes = tuple(t.shape for t in inputs)
         return tuple(outputs)
@@ -57,25 +62,29 @@ def compact_geometry(ids, means, log_scales, quats, logits):
 
 class _IndexedSH(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, ids, dirs, visible, dc, rest, degree):
+    def forward(ctx, ids, dirs, visible, dc, rest, degree, adam):
         colors = torch.empty_like(dirs)
         gate = ids.new_empty(len(ids), dtype=torch.uint8)
         buffers = (dirs, dc.contiguous(), rest.contiguous(), visible, colors, gate, ids)
         _launch("colors", dirs, buffers, len(ids), degree, 1 + rest.shape[1])
-        ctx.save_for_backward(ids, dirs, gate)
+        ctx.adam = adam
+        ctx.save_for_backward(ids, dirs, gate, *((dc, rest) if adam is not None else ()))
         ctx.dc_shape, ctx.rest_shape, ctx.degree = dc.shape, rest.shape, degree
         return colors
 
     @staticmethod
     def backward(ctx, d_colors):
-        ids, dirs, gate = ctx.saved_tensors
+        ids, dirs, gate, *params = ctx.saved_tensors
+        if ctx.adam is not None:
+            ctx.adam._queue_colors(ids, dirs, gate, params, d_colors, ctx.degree)
+            return (None,) * 7
         dc = dirs.new_empty((len(ids), *ctx.dc_shape[1:]))
         rest = dirs.new_empty((len(ids), *ctx.rest_shape[1:]))
         launch_sh(dirs, dc, rest, None, d_colors.contiguous(), gate, ctx.degree, rest.shape[1] + 1, False, True)
-        return None, None, None, _row_gradient(ids, dc, ctx.dc_shape), _row_gradient(ids, rest, ctx.rest_shape), None
+        return None, None, None, _row_gradient(ids, dc, ctx.dc_shape), _row_gradient(ids, rest, ctx.rest_shape), None, None
 
 
-def indexed_sh_color(ids, dirs, visible, dc, rest, degree):
+def indexed_sh_color(ids, dirs, visible, dc, rest, degree, *, adam=None):
     """Evaluate active SH bands directly from the original coefficient tables."""
     _check_rows(ids, dirs)
     if (dirs.shape != (len(ids), 3) or visible.shape != (len(ids),) or visible.dtype != torch.bool
@@ -83,7 +92,7 @@ def indexed_sh_color(ids, dirs, visible, dc, rest, degree):
             or rest.shape[2] != 3 or degree not in range(5) or (degree + 1) ** 2 > 1 + rest.shape[1]
             or any(t.device != dirs.device or t.dtype != torch.float32 for t in (dc, rest, dirs))):
         raise ValueError("Invalid indexed SH inputs")
-    return _IndexedSH.apply(ids, dirs.detach().contiguous(), visible.contiguous(), dc, rest, degree)
+    return _IndexedSH.apply(ids, dirs.detach().contiguous(), visible.contiguous(), dc, rest, degree, adam)
 
 
 @torch.no_grad()

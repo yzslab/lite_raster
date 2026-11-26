@@ -25,6 +25,17 @@ class Args(ct.Structure):
     ]
 
 
+class AdamGroup(ct.Structure):
+    _fields_ = [(name, P) for name in ("param", "first", "second")] + [
+        (name, ct.c_float) for name in ("lr", "beta1", "beta2", "eps")]
+
+
+class ProjectionStep(ct.Structure):
+    _fields_ = [("groups", AdamGroup * 4)] + [
+        (name, P) for name in ("ids", "alpha", "length", "opacity", "d_opacity", "d_scale")
+    ] + [("geometry_grad", ct.c_bool)]
+
+
 class ProjectionArgs(ct.Structure):
     _fields_ = [
         ("inputs", P * 6), ("outputs", P * 10), ("upstream", P * 10),
@@ -41,6 +52,7 @@ def library(source, cc, channels=0, flags=0):
         lib.launch.argtypes = [ct.POINTER(Args), P, ct.c_bool]
     elif source == "fused_projection":
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
+        lib.projection_adam.argtypes = [*lib.projection.argtypes, ct.POINTER(ProjectionStep)]
     elif source == "joint_loss":
         lib.joint_loss.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_float, ct.c_float, ct.c_bool, P]
     elif source == "tile_loss":
@@ -57,6 +69,7 @@ def library(source, cc, channels=0, flags=0):
     elif source == "cluster_preprocess":
         lib.geometry.argtypes = [ct.POINTER(P), ct.c_int, ct.c_bool, P]
         lib.colors.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, P]
+        lib.colors_adam.argtypes = [ct.POINTER(P), ct.POINTER(AdamGroup), ct.c_int, ct.c_int, ct.c_int, P]
         lib.stats.argtypes = [ct.POINTER(P), ct.c_int, P]
     else:
         lib.sh_color.argtypes = [ct.POINTER(P), ct.c_int, ct.c_int, ct.c_int, ct.c_bool, P, ct.c_bool]

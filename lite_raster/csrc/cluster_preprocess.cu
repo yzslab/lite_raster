@@ -123,3 +123,50 @@ extern "C" int stats(void **p, int n, cudaStream_t st) {
                                                       (float *)p[6], (float *)p[7]);
     return cudaGetLastError();
 }
+
+#include "adam.cuh"
+
+namespace {
+struct ColorGroups { lite_raster::AdamGroup dc, rest; };
+
+template<int Degree>
+__global__ void color_backward_step(Buffers a, const int64_t *ids, ColorGroups groups, int n, int capacity) {
+    constexpr int bands = (Degree + 1) * (Degree + 1);
+    constexpr int active_width = (bands - 1) * 3, pitch = active_width | 1;
+    __shared__ float tile[4][32][pitch];
+    int i = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32, start = i - lane;
+    if (start >= n) return;
+    int row = i < n ? ids[i] : 0;
+    if (i < n) {
+        float dc[3];
+        evaluate<Degree, true>(a, i, bands, dc, tile[warp_id][lane]);
+        for (int c = 0; c < 3; ++c) adam_update(groups.dc, int64_t(row)*3+c, dc[c]);
+    }
+    __syncwarp();
+    // All lanes participate in the shuffle, including the last partial warp.
+    int width = (capacity - 1) * 3;
+    for (int j = lane; j < 32*width; j += 32) {
+        int r = j / width, c = j % width;
+        int dst = __shfl_sync(0xffffffff, row, r);
+        if (start + r < n) {
+            float grad = c < active_width ? tile[warp_id][r][c] : 0.f;
+            adam_update(groups.rest, int64_t(dst)*width+c, grad);
+        }
+    }
+}
+} // namespace
+
+extern "C" int colors_adam(void **p, const lite_raster::AdamGroup *groups, int n, int degree,
+                           int capacity, cudaStream_t stream) {
+    if (!n) return cudaSuccess;
+    Buffers a{(const float3 *)p[1], nullptr, nullptr, nullptr, (float *)p[3], (uint8_t *)p[2]};
+    ColorGroups sh{groups[0], groups[1]};
+#define STEP(d) case d: color_backward_step<d><<<(n+127)/128,128,0,stream>>>(a,(int64_t *)p[0],sh,n,capacity); break
+    switch (degree) {
+        STEP(0); STEP(1); STEP(2); STEP(3); STEP(4);
+        default: return cudaErrorInvalidValue;
+    }
+#undef STEP
+    return cudaGetLastError();
+}

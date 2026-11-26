@@ -6,7 +6,7 @@ import torch
 from .backend import P, ProjectionArgs, check_launch, gpu_cc, library, pointer
 
 
-def _run(inputs, outputs, upstream, grads, stats, spec, backward):
+def _run(inputs, outputs, upstream, grads, stats, spec, backward, step=None):
     w, h, eps, radius_clip, mode = spec
     means = inputs[0]
     if not len(means):
@@ -17,8 +17,44 @@ def _run(inputs, outputs, upstream, grads, stats, spec, backward):
         (P * 4)(*map(pointer, stats)), len(means), w, h, eps, radius_clip,
     )
     with torch.cuda.device(means.device):
-        launch = library("fused_projection", gpu_cc(means.device)).projection
-        check_launch(launch(ct.byref(args), mode, torch.cuda.current_stream().cuda_stream, backward))
+        lib = library("fused_projection", gpu_cc(means.device))
+        stream = torch.cuda.current_stream().cuda_stream
+        if step is None:
+            check_launch(lib.projection(ct.byref(args), mode, stream, backward))
+        else:
+            check_launch(lib.projection_adam(ct.byref(args), mode, stream, backward, ct.byref(step)))
+
+
+def _outputs(means, mode, compensate):
+    n = len(means)
+    radii = means.new_empty((1, n), dtype=torch.int32)
+    xy = means.new_empty((1, n, 2))
+    z = means.new_empty((1, n))
+    conic = means.new_empty((1, n, 3))
+    comp = torch.empty_like(z) if compensate else None
+    outputs = (radii, xy, z, conic, torch.empty_like(conic),
+               torch.empty_like(conic) if mode == 4 else None,
+               torch.empty_like(z) if mode == 4 else None, comp,
+               torch.empty_like(means) if mode & 1 else None,
+               torch.empty_like(means) if mode & 2 else None)
+    return outputs
+
+
+def _position_stats(means, state):
+    stats = []
+    for source, target in (("pixel", "world"), ("pixel_ssim", "world_ssim")):
+        pixel = state.get(source)
+        if pixel is None:
+            stats.extend((None, None))
+        else:
+            if pixel.dtype != means.dtype or pixel.device != means.device:
+                raise ValueError("Position statistics must use the projection's FP32 device")
+            if source == "pixel_ssim" and stats[0] is None:
+                raise RuntimeError("SSIM position statistics require full statistics too")
+            world = means.new_zeros((1, len(means), 10))
+            state[target] = world
+            stats.extend((pixel.reshape(1, len(means), 6).contiguous(), world))
+    return stats
 
 
 class _Projection(torch.autograd.Function):
@@ -26,18 +62,9 @@ class _Projection(torch.autograd.Function):
     def forward(ctx, means, scales, quats, view, K, center, spec, compensate):
         ctx.set_materialize_grads(False)
         ctx.spec = spec
-        n, mode = len(means), spec[-1]
         inputs = means, scales, quats, view, K, center
-        radii = means.new_empty((1, n), dtype=torch.int32)
-        xy = means.new_empty((1, n, 2))
-        z = means.new_empty((1, n))
-        conic = means.new_empty((1, n, 3))
-        comp = torch.empty_like(z) if compensate else None
-        outputs = (radii, xy, z, conic, torch.empty_like(conic),
-                   torch.empty_like(conic) if mode == 4 else None,
-                   torch.empty_like(z) if mode == 4 else None, comp,
-                   torch.empty_like(means) if mode & 1 else None,
-                   torch.empty_like(means) if mode & 2 else None)
+        outputs = _outputs(means, spec[-1], compensate)
+        radii, xy, _, conic, _, _, _, comp = outputs[:8]
         _run(inputs, outputs, (), (), (), spec, False)
         ctx.save_for_backward(*inputs, radii, conic, comp)
         ctx.position_moment_state = {}
@@ -52,20 +79,7 @@ class _Projection(torch.autograd.Function):
                  for t, needed in zip((means, scales, quats), ctx.needs_input_grad[:3])]
         grads.append(torch.zeros_like(view) if ctx.needs_input_grad[3] else None)
         outputs = (radii, None, None, conic, None, None, None, comp, None, None)
-        state = ctx.position_moment_state
-        stats = []
-        for source, target in (("pixel", "world"), ("pixel_ssim", "world_ssim")):
-            pixel = state.get(source)
-            if pixel is None:
-                stats.extend((None, None))
-            else:
-                if pixel.dtype != means.dtype or pixel.device != means.device:
-                    raise ValueError("Position statistics must use the projection's FP32 device")
-                if source == "pixel_ssim" and stats[0] is None:
-                    raise RuntimeError("SSIM position statistics require full statistics too")
-                world = means.new_zeros((1, len(means), 10))
-                state[target] = world
-                stats.extend((pixel.reshape(1, len(means), 6).contiguous(), world))
+        stats = _position_stats(means, ctx.position_moment_state)
         _run(inputs, outputs, [t.contiguous() if t is not None else None for t in upstream],
              grads, stats, ctx.spec, True)
         return (*grads, None, None, None, None)
