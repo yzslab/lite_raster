@@ -10,7 +10,15 @@ From the gaussian-splatting-pl checkout, in the CUDA-enabled PyTorch environment
 python -m pip install ./submodules/lite_raster
 ```
 
-The wheel contains the CUDA sources. On first use, NVCC builds the requested specialization for the active GPU and caches it under `~/.cache/lite_raster` (or `LITE_RASTER_CACHE_DIR`). Use a CUDA toolkit compatible with the installed PyTorch; point `CUDA_HOME` or `LITE_RASTER_NVCC` at the toolkit when necessary. Set `LITE_RASTER_CXX` to select a supported host compiler. Projection uses the GLM headers from the project's installed gsplat, system GLM, or the directory specified by `LITE_RASTER_GLM_INCLUDE`.
+The wheel contains the CUDA sources. Installation only packages these files. On first use, the worker compiles the requested operator for the calling GPU's compute capability. Raster kernels specialize on the exact channel count and output flags. For example, an RGB-only run builds its RGB variants, and the first request for a RaDe depth map builds the additional variant it needs. Later processes reuse the compiled libraries.
+
+Workers need NVCC, a compatible host compiler and, for fused projection, GLM headers. Set `CUDA_HOME` or `LITE_RASTER_NVCC` to select the toolkit and `LITE_RASTER_CXX` to select the host compiler. GLM is discovered from gsplat or the system include directories. You can also set `LITE_RASTER_GLM_INCLUDE` to the directory containing `glm/`.
+
+By default libraries are cached under `$XDG_CACHE_HOME/lite_raster` or `~/.cache/lite_raster`. For CLI processes and Slurm jobs on different nodes to share builds, point `LITE_RASTER_CACHE_DIR` at the same writable directory or use a shared home. The cache key includes the kernel, included project headers, GPU architecture, compiler versions and build options.
+
+Each compilation gets a private `.build-*` directory inside the cache for NVCC's temporary files and output. After NVCC succeeds, the worker atomically creates the final `.so` name with a hard link. Concurrent builders reuse the first published binary. On filesystems without hard links, publication uses an atomic rename of the complete binary. Each worker cleans only its own directory. A killed worker can leave a private directory behind, which subsequent jobs ignore.
+
+On a cache miss, workers coordinate by atomically creating a per-specialization `.building` directory. This works across NFS clients and processes accessing the same export directly on the server. The owner removes its marker when finished. If creating it fails, a worker can compile independently. If the marker already exists, a worker waits for the published result or retries acquiring the marker for up to 60 seconds before proceeding independently. A warm cache hit skips this coordination, including any marker left by a killed process.
 
 ## Project renderer
 

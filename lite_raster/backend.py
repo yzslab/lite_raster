@@ -1,20 +1,12 @@
-"""Build private CUDA specializations and launch on the calling torch stream."""
+"""Load on-demand CUDA specializations and launch on the calling torch stream."""
 
 import ctypes as ct
 import functools
-import hashlib
-import os
-import subprocess
-import shutil
-from importlib.util import find_spec
-from pathlib import Path
 
 import torch
-from filelock import FileLock
+from ._toolchain import HERE, RASTER_LIBRARIES, _compiler, compiled_path
 
-HERE = Path(__file__).resolve().parent / "csrc"
 P = ct.c_void_p
-_RASTER_LIBRARIES = ("raster", "warp_backward", "chunk_backward")
 
 
 class Args(ct.Structure):
@@ -41,79 +33,11 @@ class ProjectionArgs(ct.Structure):
         ("eps", ct.c_float), ("radius_clip", ct.c_float),
     ]
 
-def _compiler():
-    nvcc = os.environ.get("LITE_RASTER_NVCC") or shutil.which("nvcc")
-    if not nvcc:
-        root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
-        nvcc = str(Path(root) / "bin/nvcc")
-    if not Path(nvcc).is_file():
-        raise RuntimeError("lite_raster requires nvcc. Set CUDA_HOME or LITE_RASTER_NVCC.")
-    return str(Path(nvcc).resolve())
-
-
-def _glm_include():
-    explicit = os.environ.get("LITE_RASTER_GLM_INCLUDE")
-    if explicit:
-        candidates = [Path(explicit)]
-    else:
-        gsplat = find_spec("gsplat")
-        candidates = []
-        if gsplat and gsplat.origin:
-            candidates.append(Path(gsplat.origin).parent / "cuda/csrc/third_party/glm")
-        candidates.extend((Path("/usr/local/include"), Path("/usr/include")))
-    for root in candidates:
-        if (root / "glm/gtc/type_ptr.hpp").is_file():
-            return root
-    raise RuntimeError("Install GLM headers or point LITE_RASTER_GLM_INCLUDE at the directory containing glm/.")
-
 
 @functools.lru_cache(None)
 def library(source, cc, channels=0, flags=0):
-    path = HERE / (source + ".cu")
-    digest = hashlib.sha256(path.read_bytes())
-    nvcc = _compiler()
-    cuda_lib = Path(nvcc).parent.parent / "lib64"
-    options = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "--cudart", "shared",
-               "-Xlinker", "-rpath", "-Xlinker", str(cuda_lib), f"-arch=sm_{cc}",
-               f"-DCHANNELS={channels}", f"-DFLAGS={flags}"]
-    compiler = os.environ.get("LITE_RASTER_CXX") or os.environ.get("CXX")
-    if compiler:
-        options += ["-ccbin", compiler]
-    if source == "fused_projection":
-        headers = ("rade_geometry.cuh", "pinhole.cuh")
-        glm = _glm_include()
-        options += ["--use_fast_math", "--expt-relaxed-constexpr", "-I" + str(glm)]
-        digest.update((glm / "glm/detail/setup.hpp").read_bytes())
-    elif source == "chunk_backward":
-        headers = ("raster_args.cuh", "chunk_maps.cuh")
-    elif source in _RASTER_LIBRARIES:
-        headers = ("raster_args.cuh",)
-    elif source == "joint_loss":
-        options += ["--use_fast_math"]
-        headers = ()
-    elif source == "cluster_preprocess":
-        headers = ("sh_color.cu",)
-    elif source == "cluster_bounds":
-        headers = ("cluster_cull.cu",)
-    else:
-        headers = ()
-    for header in headers:
-        digest.update((HERE / header).read_bytes())
-    digest.update(repr((nvcc, os.stat(nvcc).st_mtime_ns, options)).encode())
-    cache = Path(os.getenv("LITE_RASTER_CACHE_DIR") or
-                 Path(os.getenv("XDG_CACHE_HOME") or Path.home() / ".cache") / "lite_raster")
-    cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"{source}_{digest.hexdigest()[:20]}.so"
-    with FileLock(str(target) + ".lock"):
-        if not target.is_file():
-            tmp = target.with_suffix(".tmp.so")
-            try:
-                subprocess.run([nvcc, *options, str(path), "-o", str(tmp)], check=True)
-                tmp.replace(target)
-            finally:
-                tmp.unlink(missing_ok=True)
-    lib = ct.CDLL(str(target))
-    if source in _RASTER_LIBRARIES:
+    lib = ct.CDLL(str(compiled_path(source, cc, channels, flags)))
+    if source in RASTER_LIBRARIES:
         lib.launch.argtypes = [ct.POINTER(Args), P, ct.c_bool]
     elif source == "fused_projection":
         lib.projection.argtypes = [ct.POINTER(ProjectionArgs), ct.c_int, P, ct.c_bool]
